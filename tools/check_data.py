@@ -1,7 +1,3 @@
-# ------------------------------------------------------------------------
-# Modified from LLaVA (https://github.com/haotian-liu/LLaVA)
-# Copyright 2025 Junfeng Wu
-# ------------------------------------------------------------------------
 import os
 from dataclasses import asdict
 from datetime import datetime
