@@ -5,7 +5,7 @@ from torch import nn
 from transformers.models.qwen3.modeling_qwen3 import *
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3DecoderLayer, Optional, Cache, Unpack, FlashAttentionKwargs, Qwen3Attention, apply_rotary_pos_emb,  # noqa
-    Qwen3MLP, BaseModelOutputWithPast, Qwen3RMSNorm, eager_attention_forward, Callable, ALL_ATTENTION_FUNCTIONS, # noqa
+    Qwen3MLP, BaseModelOutputWithPast, Qwen3RMSNorm, eager_attention_forward, Callable, ALL_ATTENTION_FUNCTIONS,  # noqa
     Union, KwargsForCausalLM,  # noqa
 )
 from modeling.shared_func_module import UniQwen3Config
@@ -13,6 +13,7 @@ from modeling import shared_func_module
 from accelerate import Accelerator
 
 accelerator = Accelerator()
+
 
 class MoTQwen3Attention(Qwen3Attention):
     def __init__(self, config: UniQwen3Config, layer_idx: int):
@@ -42,13 +43,13 @@ class MoTQwen3Attention(Qwen3Attention):
         return query_states, key_states, value_states
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: tuple[torch.Tensor, torch.Tensor],
+            attention_mask: Optional[torch.Tensor],
+            past_key_value: Optional[Cache] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         # 想兼容推理，需要考虑什么？1. 没有 vis 或 text tokens 2. bs > 1
         vis_mask: torch.Tensor = self.buffer_vis_mask
@@ -59,7 +60,8 @@ class MoTQwen3Attention(Qwen3Attention):
 
         bs, seq_len, d = hidden_states.shape
         q = torch.empty(bs, seq_len, self.config.num_attention_heads, self.head_dim, device=hidden_states.device, dtype=hidden_states.dtype)
-        k, v = [torch.empty(bs, seq_len, self.config.num_key_value_heads, self.head_dim, device=hidden_states.device, dtype=hidden_states.dtype)] * 2
+        k = torch.empty(bs, seq_len, self.config.num_key_value_heads, self.head_dim, device=hidden_states.device, dtype=hidden_states.dtype)
+        v = torch.empty(bs, seq_len, self.config.num_key_value_heads, self.head_dim, device=hidden_states.device, dtype=hidden_states.dtype)
 
         text_tokens = text_mask.sum().item()
         if text_tokens > 0:
@@ -131,12 +133,12 @@ class MoTQwen3MLP(Qwen3MLP):
         if has_text_token:
             text_hidden_states = x[text_mask, :]
             text_expert_output = self.down_proj(self.act_fn(self.gate_proj(text_hidden_states)) * self.up_proj(text_hidden_states))
-            final_output[text_mask, :] = (text_expert_output if has_text_token else 0)
+            final_output[text_mask, :] = text_expert_output
 
         if has_vis_token:
             vision_hidden_states = x[vision_mask, :]
             vision_expert_output = self.vision_down_proj(self.act_fn(self.vision_gate_proj(vision_hidden_states)) * self.vision_up_proj(vision_hidden_states))
-            final_output[vision_mask, :] = (vision_expert_output if has_vis_token else 0)
+            final_output[vision_mask, :] = vision_expert_output
 
         return final_output
 
@@ -199,3 +201,89 @@ class MoTQwen3ForCausalLM(Qwen3ForCausalLM):
             logits_to_keep=logits_to_keep,
             **kwargs,
         )
+
+
+if __name__ == "__main__":
+    # 写一个测试，输入随机，注意一定要同时包含 text 和 vision token。验证输出的 logits 是否相同
+    model_path = "../mock/ckpts/Qwen2.5-1.5B-uni-X/data-v4-1.5B-mot-t2i_80-ignore_ins-lr5e-5-ablation-7card-rerun/20250924_1921"
+
+    # Use CUDA if available, otherwise CPU
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # Set inference mode
+    torch.set_grad_enabled(False)
+
+    # 1. Create the inference-optimized model and load weights
+    print("Creating inference model and loading weights...")
+    inference_model = MoTQwen3ForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        device_map=device,
+    )
+    config = inference_model.config
+    inference_model.eval()
+
+    # 2. Prepare a mixed-modality input
+    # Ensure there are both text (< real_text_vocab_size) and vision tokens (>= real_text_vocab_size)
+    text_token_1 = 100
+    text_token_2 = 200
+    vision_start_id = config.vision_start_id
+    vision_token_1 = config.real_text_vocab_size + 10
+    vision_token_2 = config.real_text_vocab_size + 20
+
+    # input_ids = torch.tensor([[text_token_1, text_token_2, vision_start_id, vision_token_1, vision_token_2, text_token_2]], device=device)
+    input_ids = torch.cat([torch.randint(config.real_text_vocab_size, (1, 321), device=device),
+                           torch.randint(config.real_text_vocab_size, config.real_text_vocab_size + 8191, (1, 400), device=device),
+                           torch.randint(config.real_text_vocab_size, (1, 321), device=device), ], dim=-1)
+    attention_mask = torch.ones_like(input_ids)
+
+    print(f"\nInput IDs shape: {input_ids.shape}")
+    # TODO 写一个不用cache（prefill）和用cache（decode）的logits对比，来保证推理时是正确的
+    print("\n--- Testing consistency between prefill and decode ---")
+
+    # 1. Prefill pass: 一次性处理整个序列，不使用预先存在的cache
+    print("Running prefill pass for the whole sequence...")
+    with torch.no_grad():
+        prefill_outputs = inference_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+    # 获取最后一个token的logits
+    last_logit_prefill = prefill_outputs.logits[:, -1, :]
+    print("Prefill pass complete.")
+
+    # 2. Decode pass: 先处理n-1个token生成cache，然后用cache处理最后一个token
+    print("\nRunning decode pass (prefill n-1 tokens, then decode 1 token)...")
+    input_ids_pre_cache = input_ids[:, :-1]
+    attention_mask_pre_cache = attention_mask[:, :-1]
+    last_token_input = input_ids[:, -1:]
+
+    # 使用前n-1个token生成cache
+    with torch.no_grad():
+        pre_cache_outputs = inference_model(input_ids=input_ids_pre_cache, attention_mask=attention_mask_pre_cache, use_cache=True)
+        past_key_values = pre_cache_outputs.past_key_values
+
+    # 使用生成的cache和最后一个token进行decode
+    # 注意此时的attention_mask需要覆盖包括cache在内的全部序列长度
+    attention_mask_for_decode = torch.cat([attention_mask_pre_cache, torch.ones_like(last_token_input)], dim=-1)
+    with torch.no_grad():
+        decode_outputs = inference_model(
+            input_ids=last_token_input,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask_for_decode,
+            use_cache=True
+        )
+    # decode模式输出的序列长度为1
+    last_logit_decode = decode_outputs.logits[:, 0, :]
+    print("Decode pass complete.")
+
+    # 3. 对比两次得到的logits
+    print("\nComparing logits...")
+    are_close = torch.allclose(last_logit_prefill, last_logit_decode, atol=1e-1)  # 设置一个合理的容忍度
+    max_diff = torch.max(torch.abs(last_logit_prefill - last_logit_decode))
+
+    print(f"Logits are close: {are_close}")
+    print(f"Maximum absolute difference: {max_diff.item()}")
+
+    if are_close:
+        print("✅ Test Passed: Prefill and decode logits are consistent.")
+    else:
+        print("❌ Test Failed: Prefill and decode logits are NOT consistent.")
