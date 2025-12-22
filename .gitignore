@@ -1,0 +1,11 @@
+*.png
+*.jpg
+*.jpeg
+
+*.xlsx
+*.log
+*.ckpt
+
+**/.DS_Store
+
+draw_pics/pics/grad_conflict/
