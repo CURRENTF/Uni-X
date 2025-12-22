@@ -30,7 +30,7 @@ from string import punctuation
 API 请求示例 (使用 curl):
 curl http://localhost:33218/v1/chat/completions \
   -H "Content-Type": "application/json" \
-  -d '{
+  -d '{ 
     "model": "uni-model",
     "messages": [
       {
@@ -49,6 +49,7 @@ curl http://localhost:33218/v1/chat/completions \
 # 在目前的分数之外，对每个目录，计算 acc, acc+这两个指标 acc+就是对于一对数据，都答对了才算对
 
 # MMBench 数据里面已经处理好了，image可能是base64字符串，也可能是某个row index，如果是index，就需要使用那个index的image
+# 我们目前是手动实现了circular的evaluation，现在情况是他们应该已经
 # A,B,C,D并不一定都存在，需要判断如果没有该选项，构造prompt时自动跳过
 # 而且MMBench的index不连续，不能根据行号来选择。（MME和POPE的都是连续的排序好的）
 
@@ -174,6 +175,52 @@ def evaluate_yes_no(samples: List[Dict[str, Any]], server_address: str, api_npro
     return results
 
 
+def _evaluate_single_mmbench_circular(session: requests.Session, server_address: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """对单个 MMBench 题目进行循环（Circular）评测，4次请求都对才算对"""
+    options = ['A', 'B', 'C', 'D']
+    # 使用 .get() 获取选项内容，如果不存在则为 None
+    original_options_text = [row.get(opt) for opt in options]
+
+    # 如果有效选项少于2个，无法进行有意义的评测，直接返回失败
+    if sum(1 for opt in original_options_text if pd.notna(opt)) < 2:
+        return {'index': row['index'], 'ground_truth': row['answer'], 'circular_eval_passed': False, 'details': 'Not enough options for circular evaluation'}
+
+    question_base = row['question'] + (" " + str(row.get('hint', '')) if pd.notna(row.get('hint')) else "")
+    all_correct = True
+    details = []
+
+    for i in range(4):  # 4次循环平移
+        shifted_options = original_options_text[i:] + original_options_text[:i]
+
+        # 答案的索引计算逻辑不变
+        try:
+            original_correct_idx = options.index(row['answer'])
+        except ValueError:
+            # 如果答案标签（如'A'）本身就有问题，则无法评测
+            return {'index': row['index'], 'ground_truth': row['answer'], 'circular_eval_passed': False, 'details': f"Invalid answer key '{row['answer']}'"}
+
+        new_correct_letter = options[(original_correct_idx - i + 4) % 4]
+
+        # 动态构建 prompt，跳过内容为 None 或 NaN 的选项
+        option_str = "\n".join([
+            f"{opt}. {text}" for opt, text in zip(options, shifted_options) if pd.notna(text)
+        ])
+
+        prompt = (f"{question_base}\n" +
+                  option_str + "\n" +
+                  "Please answer with the letter of the correct option.")
+
+        raw_pred = _post_request(session, server_address, prompt, row['image'])
+        pred_letter = _process_mmbench_response(raw_pred)
+        details.append({'shift': i, 'ground_truth': new_correct_letter, 'prediction': pred_letter})
+
+        if pred_letter != new_correct_letter:
+            all_correct = False
+            break  # 提前退出
+
+    return {'index': row['index'], 'ground_truth': row['answer'], 'circular_eval_passed': all_correct, 'details': details}
+
+
 def _evaluate_single_mmbench_regular(session: requests.Session, server_address: str, row: Dict[str, Any]) -> Dict[str, Any]:
     """对单个 MMBench 题目进行常规评测"""
     options = ['A', 'B', 'C', 'D']
@@ -182,7 +229,7 @@ def _evaluate_single_mmbench_regular(session: requests.Session, server_address: 
         f"{opt}. {row[opt]}" for opt in options if opt in row and pd.notna(row[opt])
     ])
 
-    prompt = (f"{row['question']}" +
+    prompt = (f"{row['question']}"
               (" " + str(row.get('hint', '')) if pd.notna(row.get('hint')) else "") + "\n" +
               option_str + "\n" +  # 使用动态生成的选项字符串
               "Please answer with the letter of the correct option.")
@@ -193,15 +240,15 @@ def _evaluate_single_mmbench_regular(session: requests.Session, server_address: 
     return {'index': row['index'], 'ground_truth': row['answer'], 'prediction': pred_letter, 'raw_prediction': raw_pred, 'correct': pred_letter == row['answer']}
 
 
-def evaluate_mmbench(samples: List[Dict[str, Any]], server_address: str, api_nproc: int) -> List[Dict[str, Any]]:
-    """处理选择题 (MMBench)"""
+def evaluate_mmbench(samples: List[Dict[str, Any]], server_address: str, api_nproc: int, circular: bool) -> List[Dict[str, Any]]:
+    """处理选择题 (MMBench)，支持常规和循环两种评测模式"""
     results = []
-    eval_func = _evaluate_single_mmbench_regular
+    eval_func = _evaluate_single_mmbench_circular if circular else _evaluate_single_mmbench_regular
 
     with ThreadPoolExecutor(max_workers=api_nproc) as executor:
         with requests.Session() as session:
             future_to_sample = {executor.submit(eval_func, session, server_address, s): s for s in samples}
-            for future in tqdm(as_completed(future_to_sample), total=len(samples), desc=f"Evaluating MMBench"):
+            for future in tqdm(as_completed(future_to_sample), total=len(samples), desc=f"Evaluating MMBench (circular={circular})"):
                 sample = future_to_sample[future]
                 try:
                     results.append(future.result())
@@ -374,14 +421,18 @@ def print_report(results: List[Dict[str, Any]], task: str, df: pd.DataFrame) -> 
 
 
     elif 'MMBench' in task:
-        correct_count = sum(1 for r in results if r.get('correct', False))
+        is_circular = results and 'circular_eval_passed' in results[0]
+        key = 'circular_eval_passed' if is_circular else 'correct'
+        correct_count = sum(1 for r in results if r.get(key, False))
         accuracy = correct_count / len(results) if results else 0
 
+        print(f"Mode: {'Circular' if is_circular else 'Regular'} Evaluation")
         print(f"Total Samples: {len(results)}, Correctly Answered: {correct_count}")
         print(f"Accuracy: {accuracy:.4f}")
 
         summary = {
             "task": task,
+            "mode": 'Circular' if is_circular else 'Regular',
             "total_samples": len(results),
             "correctly_answered": correct_count,
             "accuracy": accuracy
@@ -421,6 +472,7 @@ def main(task: str, base_path: str = "~/LMUData/",
          server_address: str = "http://localhost:33218/v1/chat/completions",
          log_path: str = './outputs/eval_vqa_res/',
          api_nproc: int = 100,
+         circular: bool = False,
          save_name: str = 'untitled'):
     """
     VQA 评测脚本
@@ -431,6 +483,7 @@ def main(task: str, base_path: str = "~/LMUData/",
         server_address (str): 模型 API 服务器地址.
         log_path (str): 保存预测结果的目录.
         api_nproc (int): 并发请求数量.
+        circular (bool): 是否对 MMBench 进行 Circular 评测.
         save_name (str): 保存文件时使用的自定义名称.
     """
     # 准备路径和日志文件
@@ -511,7 +564,7 @@ def main(task: str, base_path: str = "~/LMUData/",
     if task in ['MME', 'POPE']:
         results = evaluate_yes_no(samples, server_address, api_nproc, task)
     elif 'MMBench' in task:
-        results = evaluate_mmbench(samples, server_address, api_nproc)
+        results = evaluate_mmbench(samples, server_address, api_nproc, circular)
     elif task == 'SEEDBench_IMG':
         results = evaluate_seedbench(samples, server_address, api_nproc)
     else:
