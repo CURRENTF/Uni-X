@@ -1,3 +1,29 @@
+# [ICLR 2026] Uni-X: Mitigating Modality Conflict with a Two-End-Separated Architecture for Unified Multimodal Models
+
+[![arXiv](https://img.shields.io/badge/arXiv-2509.24365-b31b1b.svg?logo=arxiv)](https://arxiv.org/abs/2509.24365)
+[![Hugging Face](https://img.shields.io/badge/HuggingFace-JitaiHao%2FUni--X--3B-yellow?logo=huggingface)](https://huggingface.co/JitaiHao/Uni-X-3B)
+
+## Motivation
+
+<p align="center">
+  <img src="assets/teaser.png" alt="Uni-X teaser" width="85%" />
+</p>
+
+We find that unified multimodal models (UMMs) suffer from severe gradient conflicts in shallow and deep layers, while the conflicts are largely alleviated in middle layers. We attribute this to fundamental representational discrepancies between vision and text: a single shared set of modules struggles to model two modalities with markedly different distributions. To address this, we propose an X-shaped architecture that separates modality-specific processing at both ends and shares the middle, effectively mitigating cross-modal gradient conflicts.
+
+## Method
+
+<p align="center">
+  <img src="assets/uni-x.png" alt="Uni-X architecture" width="95%" />
+</p>
+
+**Uni-X vs. modality-shared transformer**
+
+- **Baseline (left)**: a fully shared transformer can encounter gradient conflicts in shallow and deep layers due to mismatched statistical properties between vision and text tokens.
+- **Uni-X (right)**: a two-end-separated, middle-shared design:
+  - **Modality-specific layers at both ends** handle low-level feature processing and modality-aligned decoding.
+  - A **shared middle block** performs high-level semantic fusion.
+
 ## Note
 Since the majority of the training data for text-image pairs consists of Chinese data, it is recommended to use Chinese prompts for Text-to-Image testing to achieve optimal results. Other benchmarks can still be evaluated in English.
 
@@ -240,14 +266,12 @@ This project's partial code is based on https://github.com/FoundationVision/Liqu
 ## Citation
 
 ```text
-@article{hao2025unixmitigatingmodalityconflict,
-      title={Uni-X: Mitigating Modality Conflict with a Two-End-Separated Architecture for Unified Multimodal Models}, 
-      author={Jitai Hao and Hao Liu and Xinyan Xiao and Qiang Huang and Jun Yu},
-      year={2025},
-      eprint={2509.24365},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      journal={arXiv preprint},
-      url={https://arxiv.org/abs/2509.24365}, 
+@inproceedings{
+  hao2026unix,
+  title={Uni-X: Mitigating Modality Conflict with a Two-End-Separated Architecture for Unified Multimodal Models},
+  author={Jitai Hao and Hao Liu and Xinyan Xiao and Qiang Huang and Jun Yu},
+  booktitle={The Fourteenth International Conference on Learning Representations},
+  year={2026},
+  url={https://openreview.net/forum?id=IJLIYpCkwz}
 }
 ```
