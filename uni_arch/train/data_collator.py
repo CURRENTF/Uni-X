@@ -112,7 +112,58 @@ class DataCollatorForSupervisedDataset(object):
     data_args: None
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        raise NotImplementedError
+        processed_instances = []
+        processor = DataCollatorSFTPacked(tokenizer=self.tokenizer, data_args=self.data_args)
+        for source in instances:
+            if "input_ids" in source and "labels" in source:
+                processed_instances.append(
+                    {
+                        "input_ids": torch.tensor(source["input_ids"], dtype=torch.long),
+                        "labels": torch.tensor(source["labels"], dtype=torch.long),
+                        "data_type": source.get("data_type", "text"),
+                    }
+                )
+                continue
+            processed = processor._process_source(source)
+            if processed is not None:
+                processed_instances.append(processed)
+
+        if not processed_instances:
+            raise ValueError("No valid instances in batch")
+
+        max_length = max(item["input_ids"].shape[0] for item in processed_instances)
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.unk_token_id
+        if pad_id is None:
+            raise ValueError("tokenizer has no pad/eos/unk token id")
+        input_ids = []
+        labels = []
+        attention_mask = []
+
+        for item in processed_instances:
+            seq_len = item["input_ids"].shape[0]
+            pad_len = max_length - seq_len
+            input_ids.append(torch.cat([
+                item["input_ids"],
+                torch.full((pad_len,), pad_id, dtype=torch.long),
+            ]))
+            labels.append(torch.cat([
+                item["labels"],
+                torch.full((pad_len,), IGNORE_INDEX, dtype=torch.long),
+            ]))
+            attention_mask.append(torch.cat([
+                torch.ones(seq_len, dtype=torch.long),
+                torch.zeros(pad_len, dtype=torch.long),
+            ]))
+
+        return {
+            "input_ids": torch.stack(input_ids, dim=0),
+            "labels": torch.stack(labels, dim=0),
+            "attention_mask": torch.stack(attention_mask, dim=0),
+        }
 
 
 @dataclass
@@ -351,7 +402,6 @@ class DataCollatorPacked(object):
                 raise ValueError("理论上不应该出现这个情况")
 
             num_vis_tokens = (input_ids >= len(self.tokenizer)).sum().item()
-            assert len(self.tokenizer) == 151665, "only qwen2.5 now .. "
             assert num_vis_tokens % 1024 == 0, f"{num_vis_tokens}"
 
             targets = input_ids.clone()
@@ -502,7 +552,6 @@ class DataCollatorSFTPacked(DataCollatorPacked):
                 targets = targets[:self.tokenizer.model_max_length]
 
             num_vis_tokens = (input_ids >= len(self.tokenizer)).sum().item()
-            assert len(self.tokenizer) == 151665, "only qwen2.5 now .. "
             assert num_vis_tokens % 1024 == 0, f"{num_vis_tokens}"
             assert targets.dtype == input_ids.dtype == torch.long, f"{targets.dtype} {input_ids.dtype} {vqcode.dtype}"
             # Include data_type to inform the packing logic
@@ -511,7 +560,10 @@ class DataCollatorSFTPacked(DataCollatorPacked):
         else:  # Text pretrain mode
             if "input_ids" in sources:
                 input_ids = torch.tensor(sources["input_ids"], dtype=torch.long)
-                targets = input_ids.clone()
+                if "labels" in sources:
+                    targets = torch.tensor(sources["labels"], dtype=torch.long)
+                else:
+                    targets = input_ids.clone()
             else:
                 text = sources.get('text', None)
                 instruction_len = 0

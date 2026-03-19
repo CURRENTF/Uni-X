@@ -1,4 +1,4 @@
-from datasets import Features, List, Value
+from datasets import Features, Sequence, Value
 
 FEATURES = Features({
     "id": Value("string"),
@@ -9,7 +9,7 @@ FEATURES = Features({
     "caption": Value("string"),
     "vqcode_512": Value("string"),
     "vqcode_multi768": Value("string"),
-    "conversations": List(Features({"from": Value("string"), "value": Value("string")})),
+    "conversations": Sequence(Features({"from": Value("string"), "value": Value("string")})),
     "height": Value("string"),
     "width": Value("string"),
     "length": Value("float64"),

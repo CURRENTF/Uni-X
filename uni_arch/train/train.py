@@ -1,4 +1,6 @@
+import json
 import os
+import re
 from dataclasses import asdict
 from datetime import datetime
 import wandb
@@ -20,10 +22,6 @@ from uni_arch.train.data_collator import DataCollatorForSupervisedDataset, DataC
 
 from modeling.uni_x_qwen3 import UniQwen3ForCausalLM
 from modeling.shared_func_module import UniQwen3Config
-# from modeling.uni_share_qwen3 import UniShareQwen3ForCausalLM
-from modeling.uni_share_v3_qwen2_5 import UniShareQwen2ForCausalLM as UniShareQwen3ForCausalLM
-from modeling.mot_qwen import MoTQwen3ForCausalLM
-from modeling.moe_qwen import HardMoeQwen3CausalLM
 from tools.log import main_logger
 from accelerate import Accelerator
 from configs.data_features import FEATURES
@@ -33,12 +31,61 @@ accelerator = Accelerator()
 datasets.config.STREAMING_READ_MAX_RETRIES = 10000  # noqa
 
 
+def _infer_uni_qwen_checkpoint_args(model_name_or_path: str) -> Dict[str, int]:
+    index_path = os.path.join(model_name_or_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        return {}
+
+    with open(index_path) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    inferred = {}
+
+    encode_layers = [
+        int(match.group(1))
+        for key in weight_map
+        if (match := re.match(r"model\.vision_encode_layers\.(\d+)\.", key))
+    ]
+    decode_layers = [
+        int(match.group(1))
+        for key in weight_map
+        if (match := re.match(r"model\.vision_decode_layers\.(\d+)\.", key))
+    ]
+    inferred["vision_encode_layers"] = max(encode_layers) + 1 if encode_layers else 0
+    inferred["vision_decode_layers"] = max(decode_layers) + 1 if decode_layers else 0
+
+    has_share_ffn = any(".share_gate_proj." in key for key in weight_map)
+    has_vision_ffn = any(".vision_gate_proj." in key for key in weight_map)
+    inferred["add_share_ffn"] = int(has_share_ffn or has_vision_ffn)
+    inferred["use_share_ffn"] = int(has_share_ffn or has_vision_ffn)
+    inferred["ffn_share_size"] = 0
+    inferred["ffn_vision_size"] = 0
+
+    has_share_attn = any(
+        token in key
+        for key in weight_map
+        for token in ("v_q_proj", "v_k_proj", "v_o_proj", "share_attn")
+    )
+    inferred["use_share_attn"] = int(has_share_attn)
+    if not has_share_attn:
+        inferred["attn_v_q_heads"] = 0
+
+    return inferred
+
+
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     data_path = data_args.data_path
     percentage = data_args.percentage
     shuffleseed = data_args.shuffleseed
+
+    def _load_single_dataset(hgdata_path, streaming):
+        if os.path.isdir(hgdata_path) and os.path.exists(os.path.join(hgdata_path, "dataset_info.json")):
+            return load_from_disk(hgdata_path)
+        if hgdata_path.endswith(".json") or hgdata_path.endswith(".jsonl"):
+            return load_dataset("json", data_files=hgdata_path, streaming=streaming, features=FEATURES)
+        return load_dataset(hgdata_path, streaming=streaming, features=FEATURES)
 
     if '^^' in data_path:
         data_paths = data_path.split('^^')
@@ -49,7 +96,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
         hgdata_list = []
         print('loading subsets...')
         for percent, hgdata_path in zip(percentages, data_paths):
-            subset = load_dataset(hgdata_path, streaming=data_args.streaming_data, features=FEATURES)
+            subset = _load_single_dataset(hgdata_path, streaming=data_args.streaming_data)
             if isinstance(subset, DatasetDict) or isinstance(subset, IterableDatasetDict):
                 subset = subset["train"]
             if not data_args.streaming_data:
@@ -62,10 +109,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
             train_dataset = train_dataset.shuffle(seed=shuffleseed)
     else:
         print('loading subsets...')
-        if data_args.streaming_data:
-            train_dataset = load_dataset(data_path, streaming=True, features=FEATURES)
-        else:
-            train_dataset = load_dataset(data_path, streaming=False, features=FEATURES, num_proc=8)
+        train_dataset = _load_single_dataset(data_path, streaming=data_args.streaming_data)
         if isinstance(train_dataset, DatasetDict) or isinstance(train_dataset, IterableDatasetDict):
             train_dataset = train_dataset["train"]
         percentage = float(percentage)
@@ -147,6 +191,11 @@ def load_model_and_tokenizer(model_args: ModelArguments, data_args: DataArgument
     elif model_args.model_custom_cls == "uni_qwen":
         cfg = UniQwen3Config.from_pretrained(model_args.model_name_or_path, attn_implementation=attn_implementation)
         vision_start_token_id = tokenizer('<|vision_start|>', add_special_tokens=False).input_ids[0]
+        inferred_uni_args = _infer_uni_qwen_checkpoint_args(model_args.model_name_or_path)
+        if inferred_uni_args:
+            print(f"[align] inferred Uni-Qwen args from checkpoint: {inferred_uni_args}")
+            for key, value in inferred_uni_args.items():
+                setattr(model_args, key, value)
         cfg.set_extra_args(
             # uni x params
             vision_encode_layers=model_args.vision_encode_layers,
@@ -173,10 +222,13 @@ def load_model_and_tokenizer(model_args: ModelArguments, data_args: DataArgument
         if model_args.model_spec_module == "x":
             cls = UniQwen3ForCausalLM
         elif model_args.model_spec_module == "share":
+            from modeling.uni_share_v3_qwen2_5 import UniShareQwen2ForCausalLM as UniShareQwen3ForCausalLM
             cls = UniShareQwen3ForCausalLM
         elif model_args.model_spec_module == "moe":
+            from modeling.moe_qwen import HardMoeQwen3CausalLM
             cls = HardMoeQwen3CausalLM
         elif model_args.model_spec_module == "mot":
+            from modeling.mot_qwen import MoTQwen3ForCausalLM
             cls = MoTQwen3ForCausalLM
         else:
             raise ValueError("Unsupported model spec module")
@@ -249,7 +301,14 @@ def train(attn_implementation=None):
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
     # Initialize wandb
-    if accelerator.is_main_process:
+    report_to = training_args.report_to
+    use_wandb = False
+    if isinstance(report_to, str):
+        use_wandb = report_to.lower() == "wandb"
+    elif isinstance(report_to, (list, tuple, set)):
+        use_wandb = "wandb" in report_to
+
+    if accelerator.is_main_process and use_wandb:
         _cfg = {k: v for _args in [model_args, data_args, training_args] for k, v in asdict(_args).items()}
         wandb.init(
             project=training_args.project_name, name=training_args.run_name,
@@ -274,7 +333,7 @@ def train(attn_implementation=None):
     # Start training
     if accelerator.is_main_process:
         print("[check] resume_from_checkpoint", training_args.resume_from_checkpoint)
-    if "checkpoint" in training_args.resume_from_checkpoint:
+    if training_args.resume_from_checkpoint and "checkpoint" in training_args.resume_from_checkpoint:
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     else:
         training_args.resume_from_checkpoint = None

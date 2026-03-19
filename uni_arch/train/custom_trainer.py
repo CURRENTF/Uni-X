@@ -1,5 +1,4 @@
 import logging
-import deepspeed
 import torch
 import os
 import time
@@ -7,7 +6,6 @@ import time
 from torch import nn
 from transformers import Trainer
 from transformers.trainer import is_sagemaker_mp_enabled, get_last_checkpoint
-from transformers.integrations.deepspeed import deepspeed_config
 from tools.log import main_logger
 
 
