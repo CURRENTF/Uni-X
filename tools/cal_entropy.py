@@ -1,306 +1,402 @@
-from datasets import load_dataset, Features, Value
-from transformers import AutoTokenizer, Qwen2Tokenizer
-from tqdm import *
+import argparse
+import csv
+import json
+import os
+from pathlib import Path
+from typing import Iterable, Iterator, List, Optional
 
 import torch
-import collections
-import math
-import json
-from typing import List
-import time # 导入 time 模块
+from datasets import load_dataset
+from tqdm import tqdm
+from transformers import AutoTokenizer
 
-# 只单卡
-def calculate_ngram_conditional_entropy(token_sequences: List[torch.LongTensor], n: int = 2, device: str = 'cuda:0') -> float:
-    # TODO 给这个函数加一些执行进度的print，和一些过程的计时 (DONE)
+
+def _resolve_device(device: Optional[str]) -> str:
+    if device is None:
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is not available in this environment.")
+    return device
+
+
+def _prepare_ngram_views(
+    token_sequences: List[torch.LongTensor],
+    n: int,
+    device: str,
+    concatenate_sequences: bool,
+):
+    if concatenate_sequences:
+        long_seq = torch.cat(token_sequences, dim=0).to(device)
+        if long_seq.numel() < n:
+            return None, None
+        return long_seq.unfold(0, n, 1), long_seq.unfold(0, n - 1, 1)
+
+    all_ngrams = []
+    all_prefixes = []
+    for seq in token_sequences:
+        if seq.numel() < n:
+            continue
+        seq = seq.to(device)
+        all_ngrams.append(seq.unfold(0, n, 1))
+        all_prefixes.append(seq.unfold(0, n - 1, 1))
+
+    if not all_ngrams:
+        return None, None
+
+    return torch.cat(all_ngrams, dim=0), torch.cat(all_prefixes, dim=0)
+
+
+def calculate_ngram_conditional_entropy(
+    token_sequences: List[torch.LongTensor],
+    n: int = 2,
+    device: str = "cpu",
+    concatenate_sequences: bool = False,
+) -> float:
     """
-    根据给定的token序列，计算 n-gram 条件信息熵。(已优化)
+    Compute the n-gram conditional entropy for a list of token sequences.
 
-    此方法遵循您提供的PDF文档中的计算方式，衡量在给定前 n-1 个字符的条件下，
-    下一个字符出现的不确定性。利用 PyTorch 进行了向量化和 GPU 加速。
-
-    计算公式:
-     - n=1: H = - Σ p(w_1) * log2(p(w_1))
-     - n>1: H = - Σ p(w_1,...,w_n) * log2(p(w_n|w_1,...,w_{n-1}))
+    When `concatenate_sequences` is enabled, all sequences are concatenated
+    before extracting n-grams. This matches the original high-throughput code
+    path used during the paper experiments.
     """
-    start_time = time.time()
-    print(f"\nCalculating for n={n}...")
-
     if not isinstance(n, int) or n < 1:
-        raise ValueError("n 必须是大于或等于1的整数。")
-
-    # 如果输入为空，熵为0
+        raise ValueError("n must be an integer greater than or equal to 1.")
     if not token_sequences:
         return 0.0
 
-    # --- Case n=1: Standard Entropy (向量化实现) ---
     if n == 1:
-        # 将所有 token 序列拼接成一个长张量
-        all_tokens = torch.cat(token_sequences)
+        all_tokens = torch.cat(token_sequences, dim=0).to(device)
         total_tokens = all_tokens.numel()
-
         if total_tokens == 0:
             return 0.0
 
-        # 高效计算每个 token 的频率
         _, counts = torch.unique(all_tokens, return_counts=True)
-
-        # 计算概率 p(x)
-        p = counts.float() / total_tokens
-
-        # 计算信息熵: H = - Σ p(x) * log2(p(x))
-        entropy = -torch.sum(p * torch.log2(p))
-        print(f"n=1 calculation finished in {time.time() - start_time:.2f}s.")
+        probabilities = counts.to(dtype=torch.float64) / total_tokens
+        entropy = -torch.sum(probabilities * torch.log2(probabilities))
         return entropy.item()
 
-    # --- Case n > 1: Conditional Entropy (向量化实现) ---
-    torch.cuda.synchronize()
-    # 使用 unfold 高效地从每个序列中提取 n-grams 和 (n-1)-grams (即前缀)
-    # unfold 创建了一个滑动窗口视图，避免了 Python 循环
-    # 稍微有一些误差感觉问题不大，所以先全部cat起来
-    long_seq = torch.cat(token_sequences, dim=-1).to(device)
-    all_ngrams = long_seq.unfold(0, n, 1)
-    all_prefixes = long_seq.unfold(0, n - 1, 1)
-    print(f"[{time.time() - start_time:.2f}s] Step 1: Prepared {all_ngrams.shape[0]} n-grams.")
-
-    total_ngrams = all_ngrams.shape[0]
-    if total_ngrams == 0:
-        return 0.0
-
-    # 高效计算 n-gram 的联合频率 count(w_1, ..., w_n)
-    unique_ngrams, ngram_counts = torch.unique(all_ngrams, dim=0, return_counts=True)
-
-    # 高效计算前缀的频率 count(w_1, ..., w_{n-1})
-    unique_prefixes, prefix_counts = torch.unique(all_prefixes, dim=0, return_counts=True)
-    print(f"[{time.time() - start_time:.2f}s] Step 2: Counted {unique_ngrams.shape[0]} unique n-grams and {unique_prefixes.shape[0]} unique prefixes.")
-
-    # 为了计算条件概率，我们需要为每个 unique_ngram 找到其对应前缀的计数值。
-    # 我们创建一个从前缀到其计数的查找表 (哈希表) 来加速这个过程。
-    prefix_counts_map = {tuple(p.tolist()): c.item() for p, c in zip(unique_prefixes.cpu(), prefix_counts.cpu())}
-
-    # 提取每个 unique_ngram 的前缀
-    ngram_prefixes = unique_ngrams[:, :-1].cpu()
-
-    # 使用查找表，为每个 unique_ngram 找到其前缀的计数值
-    corresponding_prefix_counts = torch.tensor(
-        [prefix_counts_map[tuple(p.tolist())] for p in ngram_prefixes],
+    all_ngrams, all_prefixes = _prepare_ngram_views(
+        token_sequences=token_sequences,
+        n=n,
         device=device,
-        dtype=torch.float
+        concatenate_sequences=concatenate_sequences,
     )
-    print(f"[{time.time() - start_time:.2f}s] Step 3: Built and used prefix count map.")
-
-    # 转换为 float 以进行后续计算
-    ngram_counts = ngram_counts.float()
-
-    # 计算联合概率 p(w_1, ..., w_n)
-    p_ngram = ngram_counts / total_ngrams
-
-    # 计算条件概率 p(w_n | w_1, ..., w_{n-1}) = count(ngram) / count(prefix)
-    p_conditional = ngram_counts / corresponding_prefix_counts
-
-    # 过滤掉概率为0的情况，避免 log(0) 导致 nan
-    valid_indices = p_conditional > 0
-
-    # 计算条件熵: H = - Σ p(ngram) * log2(p_cond)
-    conditional_entropy = -torch.sum(
-        p_ngram[valid_indices] * torch.log2(p_conditional[valid_indices])
-    )
-
-    print(f"[{time.time() - start_time:.2f}s] Step 4: Final entropy calculation complete.")
-    return conditional_entropy.item()
-
-
-def calculate_ngram_conditional_entropy_optimized(token_sequences: List[torch.LongTensor], n: int = 2, device: str = 'cuda') -> float:
-    """
-    根据给定的token序列，计算 n-gram 条件信息熵。(已优化)
-
-    此优化版本将所有计算保留在 GPU 上，避免了低效的 GPU-CPU 数据传输
-    和 Python 字典操作，显著提升了 n > 1 时的计算性能。
-    """
-    start_time = time.time()
-    print(f"\nCalculating for n={n} (Optimized)...")
-
-    if not isinstance(n, int) or n < 1:
-        raise ValueError("n 必须是大于或等于1的整数。")
-    if not token_sequences:
+    if all_ngrams is None or all_prefixes is None:
         return 0.0
 
-    # --- Case n=1: 与原版相同 ---
+    total_ngrams = all_ngrams.shape[0]
+    unique_ngrams, ngram_counts = torch.unique(all_ngrams, dim=0, return_counts=True)
+    unique_prefixes, prefix_counts = torch.unique(all_prefixes, dim=0, return_counts=True)
+
+    prefix_counts_map = {
+        tuple(prefix.tolist()): count.item()
+        for prefix, count in zip(unique_prefixes.cpu(), prefix_counts.cpu())
+    }
+    ngram_prefixes = unique_ngrams[:, :-1].cpu()
+    corresponding_prefix_counts = torch.tensor(
+        [prefix_counts_map[tuple(prefix.tolist())] for prefix in ngram_prefixes],
+        device=device,
+        dtype=torch.float64,
+    )
+
+    ngram_counts = ngram_counts.to(device=device, dtype=torch.float64)
+    p_ngram = ngram_counts / total_ngrams
+    p_conditional = ngram_counts / corresponding_prefix_counts
+    valid = p_conditional > 0
+
+    entropy = -torch.sum(p_ngram[valid] * torch.log2(p_conditional[valid]))
+    return entropy.item()
+
+
+def _worker_calculate_entropy_chunk(args):
+    chunk, total_ngrams = args
+    chunk_prefixes = chunk[:, :-1]
+
+    unique_ngrams, ngram_inverse, ngram_counts = torch.unique(
+        chunk,
+        dim=0,
+        return_inverse=True,
+        return_counts=True,
+    )
+    _, prefix_inverse, prefix_counts = torch.unique(
+        chunk_prefixes,
+        dim=0,
+        return_inverse=True,
+        return_counts=True,
+    )
+
+    map_ngram_id_to_prefix_id = torch.empty(unique_ngrams.shape[0], dtype=torch.long)
+    map_ngram_id_to_prefix_id.scatter_(0, ngram_inverse, prefix_inverse)
+    corresponding_prefix_counts = prefix_counts[map_ngram_id_to_prefix_id]
+
+    ngram_counts = ngram_counts.to(dtype=torch.float64)
+    p_ngram = ngram_counts / total_ngrams
+    p_conditional = ngram_counts / corresponding_prefix_counts.to(dtype=torch.float64)
+    valid = p_conditional > 0
+
+    chunk_entropy = -torch.sum(p_ngram[valid] * torch.log2(p_conditional[valid]))
+    return chunk_entropy.item()
+
+
+def calculate_ngram_conditional_entropy_chunked(
+    token_sequences: List[torch.LongTensor],
+    n: int = 2,
+    num_workers: Optional[int] = None,
+) -> float:
+    """
+    Approximate large-scale entropy with CPU chunking.
+
+    This mirrors the original experimental fallback for very large token streams.
+    It requires the sequences to be treated as one concatenated stream.
+    """
+    if not isinstance(n, int) or n < 1:
+        raise ValueError("n must be an integer greater than or equal to 1.")
+    if not token_sequences:
+        return 0.0
     if n == 1:
-        all_tokens = torch.cat(token_sequences).to(device)
-        total_tokens = all_tokens.numel()
-        if total_tokens == 0:
-            return 0.0
-        _, counts = torch.unique(all_tokens, return_counts=True)
-        p = counts.float() / total_tokens
-        entropy = -torch.sum(p * torch.log2(p))
-        print(f"n=1 calculation finished in {time.time() - start_time:.2f}s.")
-        return entropy.item()
+        return calculate_ngram_conditional_entropy(token_sequences, n=1, device="cpu")
 
-    # --- Case n > 1: Conditional Entropy (全程 GPU 优化) ---
-    long_seq = torch.cat(token_sequences, dim=-1).to(device)
+    if num_workers is None:
+        num_workers = min(os.cpu_count() or 1, 16)
+    num_workers = max(1, num_workers)
 
-    # 从长序列中高效地提取所有 n-grams
+    long_seq = torch.cat(token_sequences, dim=0)
+    if long_seq.numel() < n:
+        return 0.0
+
     all_ngrams = long_seq.unfold(0, n, 1)
-    print(f"[{time.time() - start_time:.2f}s] Step 1: Prepared {all_ngrams.shape[0]} n-grams.")
-
     total_ngrams = all_ngrams.shape[0]
     if total_ngrams == 0:
         return 0.0
 
-    # 检查可用GPU数量，若多于1个，则启用并行计算
-    num_gpus = torch.cuda.device_count()
-    if num_gpus > 1:
-        print(f"[{time.time() - start_time:.2f}s] Found {num_gpus} GPUs. Using multi-GPU processing.")
+    indices = torch.arange(total_ngrams)
+    for col in range(n - 1, -1, -1):
+        indices = indices[torch.argsort(all_ngrams[indices, col], stable=True)]
+    all_ngrams = all_ngrams[indices]
 
-        # ==================== 多 GPU 并行计算 ====================
-        # 1. 字典序排序：确保相同前缀的 n-gram 在分块时能聚集在一起
-        print(f"[{time.time() - start_time:.2f}s] Step 2.1: Starting lexicographical sort on main GPU...")
-        indices = torch.arange(all_ngrams.shape[0], device=device)
-        for col in range(n - 1, -1, -1):
-            # 稳定排序是保证字典序正确的关键
-            indices = indices[torch.argsort(all_ngrams[indices, col], stable=True)]
-        all_ngrams = all_ngrams[indices]
-        del indices
-        torch.cuda.empty_cache()
-        print(f"[{time.time() - start_time:.2f}s] Step 2.2: Sorted all n-grams.")
+    chunks = torch.tensor_split(all_ngrams, num_workers, dim=0)
+    tasks = [(chunk, total_ngrams) for chunk in chunks if chunk.numel() > 0]
+    if not tasks:
+        return 0.0
 
-        # 2. 分块并将任务分发到各个GPU
-        chunks = torch.tensor_split(all_ngrams, num_gpus, dim=0)
-        total_entropy_sum = 0.0
+    if num_workers == 1:
+        return sum(_worker_calculate_entropy_chunk(task) for task in tasks)
 
-        for i, chunk in enumerate(chunks):
-            gpu_device = f'cuda:{i}'
-            chunk = chunk.to(gpu_device)
-            print(f"[{time.time() - start_time:.2f}s] Processing chunk {i+1}/{num_gpus} on {gpu_device} ({chunk.shape[0]} n-grams)...")
+    import multiprocessing as mp
 
-            # --- 在单个GPU上执行与原版类似的计算 ---
-            chunk_prefixes = chunk[:, :-1]
-            unique_ngrams, ngram_inverse, ngram_counts = torch.unique(
-                chunk, dim=0, return_inverse=True, return_counts=True
-            )
-            unique_prefixes, prefix_inverse, prefix_counts = torch.unique(
-                chunk_prefixes, dim=0, return_inverse=True, return_counts=True
-            )
+    total_entropy = 0.0
+    with mp.Pool(processes=num_workers) as pool:
+        progress = tqdm(
+            pool.imap_unordered(_worker_calculate_entropy_chunk, tasks),
+            total=len(tasks),
+            desc="Processing entropy chunks",
+        )
+        for chunk_entropy in progress:
+            total_entropy += chunk_entropy
+    return total_entropy
 
-            map_ngram_id_to_prefix_id = torch.empty(unique_ngrams.shape[0], dtype=torch.long, device=gpu_device)
-            map_ngram_id_to_prefix_id.scatter_(0, ngram_inverse, prefix_inverse)
-            corresponding_prefix_counts = prefix_counts[map_ngram_id_to_prefix_id]
 
-            ngram_counts = ngram_counts.float()
-            # 联合概率 p(ngram) 必须基于全局的总数进行归一化
-            p_ngram = ngram_counts / total_ngrams
-            # 条件概率 p(w_n|prefix) 在块内计算，由于排序，这是一个很好的近似
-            p_conditional = ngram_counts / corresponding_prefix_counts.float()
+def _iter_jsonl(path: Path) -> Iterator[dict]:
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            yield json.loads(line)
 
-            valid_indices = p_conditional > 0
-            # 计算当前块对总熵的贡献值
-            chunk_entropy_sum = -torch.sum(
-                p_ngram[valid_indices] * torch.log2(p_conditional[valid_indices])
-            )
-            total_entropy_sum += chunk_entropy_sum.item()
 
-            # 清理当前GPU的显存
-            del chunk, chunk_prefixes, unique_ngrams, ngram_inverse, ngram_counts, unique_prefixes, prefix_inverse, prefix_counts, map_ngram_id_to_prefix_id, corresponding_prefix_counts
-            torch.cuda.empty_cache()
-
-        print(f"[{time.time() - start_time:.2f}s] Step 3: Finished processing all chunks.")
-        final_entropy = total_entropy_sum
-        # ========================================================
-    else:
-        # ==================== 单 GPU 计算 (原逻辑) ====================
-        print(f"[{time.time() - start_time:.2f}s] Using single-GPU processing.")
-        all_prefixes = all_ngrams[:, :-1]  # 直接获取每个 n-gram 的前缀
-
-        # 高效计算 n-gram 的唯一值、ID映射 和 频率
-        unique_ngrams, ngram_inverse, ngram_counts = torch.unique(
-            all_ngrams, dim=0, return_inverse=True, return_counts=True
+def _load_samples(args) -> Iterable[dict]:
+    if args.input_format == "hf":
+        if not args.dataset:
+            raise ValueError("--dataset is required when --input-format hf is used.")
+        return load_dataset(
+            args.dataset,
+            args.dataset_config,
+            split=args.split,
+            streaming=args.streaming,
         )
 
-        # 同样地，计算前缀的唯一值、ID映射 和 频率
-        unique_prefixes, prefix_inverse, prefix_counts = torch.unique(
-            all_prefixes, dim=0, return_inverse=True, return_counts=True
+    if not args.input_jsonl:
+        raise ValueError("--input-jsonl is required when --input-format jsonl is used.")
+    return _iter_jsonl(Path(args.input_jsonl))
+
+
+def _parse_token_value(value) -> Optional[torch.LongTensor]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        value = json.loads(value)
+    if not isinstance(value, list):
+        raise TypeError(f"Expected a list or JSON string of tokens, got {type(value)}.")
+
+    tensor = torch.tensor(value, dtype=torch.long)
+    if tensor.numel() == 0:
+        return None
+    return tensor.reshape(-1)
+
+
+def collect_token_sequences(args) -> List[torch.LongTensor]:
+    tokenizer = None
+    if args.mode == "text":
+        if not args.tokenizer:
+            raise ValueError("--tokenizer is required when --mode text is used.")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+
+    token_sequences: List[torch.LongTensor] = []
+    progress = tqdm(desc=f"Loading {args.source_name}", total=args.max_samples)
+
+    for sample in _load_samples(args):
+        if args.mode == "text":
+            text = sample.get(args.text_key)
+            if not isinstance(text, str) or not text.strip():
+                continue
+            token_ids = tokenizer(
+                text,
+                add_special_tokens=False,
+                return_tensors="pt",
+            )["input_ids"][0]
+        else:
+            token_ids = _parse_token_value(sample.get(args.token_key))
+            if token_ids is None:
+                continue
+
+        if token_ids.numel() == 0:
+            continue
+
+        token_sequences.append(token_ids.cpu())
+        progress.update(1)
+
+        if args.max_samples and len(token_sequences) >= args.max_samples:
+            break
+
+    progress.close()
+
+    if not token_sequences:
+        raise ValueError("No valid token sequences were loaded from the provided input.")
+    return token_sequences
+
+
+def write_results_csv(output_csv: Path, rows: List[dict], append: bool) -> None:
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = output_csv.exists()
+
+    with output_csv.open("a" if append else "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "source",
+                "n",
+                "entropy",
+                "mode",
+                "method",
+                "concatenate_sequences",
+            ],
         )
-        print(f"[{time.time() - start_time:.2f}s] Step 2: Counted {unique_ngrams.shape[0]} unique n-grams and {unique_prefixes.shape[0]} unique prefixes using torch.unique.")
-
-        # 优化的核心步骤: 创建从 unique_ngram ID 到 unique_prefix ID 的映射
-        map_ngram_id_to_prefix_id = torch.empty(unique_ngrams.shape[0], dtype=torch.long, device=device)
-        map_ngram_id_to_prefix_id.scatter_(0, ngram_inverse, prefix_inverse)
-        corresponding_prefix_counts = prefix_counts[map_ngram_id_to_prefix_id]
-        print(f"[{time.time() - start_time:.2f}s] Step 3: Built and used prefix count map entirely on GPU.")
-
-        ngram_counts = ngram_counts.float()
-        p_ngram = ngram_counts / total_ngrams
-        p_conditional = ngram_counts / corresponding_prefix_counts.float()
-        valid_indices = p_conditional > 0
-
-        # 计算条件熵
-        final_entropy = -torch.sum(
-            p_ngram[valid_indices] * torch.log2(p_conditional[valid_indices])
-        ).item()
-        # ==========================================================
-
-    print(f"[{time.time() - start_time:.2f}s] Step 4: Final entropy calculation complete.")
-    return final_entropy
+        if not append or not file_exists:
+            writer.writeheader()
+        writer.writerows(rows)
 
 
-def get_tensor_list(data, tkn: Qwen2Tokenizer):
-    lst = []
-    total_token_num = 0
-    for sample in tqdm(data, desc="tokenize ..."):
-        # 对每个文本样本进行分词，不添加特殊token，并返回PyTorch张量
-        tensor = tkn(sample['text'], add_special_tokens=False, return_tensors='pt')['input_ids'][0]
-        lst.append(tensor)
-        assert tensor.dim() == 1
-        total_token_num += tensor.numel()
-    return lst
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compute n-gram conditional entropy for text or token sequences.",
+    )
+    parser.add_argument("--source-name", required=True, help="Label used in printed logs and CSV output.")
+    parser.add_argument(
+        "--input-format",
+        choices=["hf", "jsonl"],
+        required=True,
+        help="Read from a Hugging Face dataset or a local JSONL file.",
+    )
+    parser.add_argument("--dataset", help="Dataset name or local dataset path for --input-format hf.")
+    parser.add_argument("--dataset-config", help="Optional dataset config name.")
+    parser.add_argument("--split", default="train", help="Dataset split for --input-format hf.")
+    parser.add_argument("--streaming", action="store_true", help="Enable Hugging Face streaming mode.")
+    parser.add_argument("--input-jsonl", help="Path to a local JSONL file.")
+
+    parser.add_argument(
+        "--mode",
+        choices=["text", "tokens"],
+        required=True,
+        help="Use raw text with a tokenizer or pre-tokenized sequences.",
+    )
+    parser.add_argument("--text-key", default="text", help="Field name containing raw text.")
+    parser.add_argument("--token-key", default="tokens", help="Field name containing token sequences.")
+    parser.add_argument("--tokenizer", help="Tokenizer path or model name used when --mode text is selected.")
+
+    parser.add_argument(
+        "--n-values",
+        type=int,
+        nargs="+",
+        default=[1, 2, 3, 4],
+        help="List of n values to evaluate.",
+    )
+    parser.add_argument(
+        "--method",
+        choices=["exact", "chunked"],
+        default="exact",
+        help="Exact computation or chunked CPU approximation for very large streams.",
+    )
+    parser.add_argument("--device", help="Torch device for exact mode. Defaults to cuda:0 when available.")
+    parser.add_argument(
+        "--concatenate-sequences",
+        action="store_true",
+        help="Concatenate all sequences before extracting n-grams. This matches the original paper code path.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=min(os.cpu_count() or 1, 16),
+        help="Worker count used by the chunked CPU approximation.",
+    )
+    parser.add_argument("--max-samples", type=int, help="Optional cap on the number of loaded sequences.")
+    parser.add_argument("--output-csv", help="Optional CSV path for saving entropy results.")
+    parser.add_argument("--append", action="store_true", help="Append to an existing CSV instead of overwriting it.")
+    return parser.parse_args()
 
 
 def main():
-    # 数据集路径，请根据您的环境修改
-    wiki_path = "../mock/datasets/wikitext-en-de"
-    # 模型路径，请根据您的环境修改
-    model_path = "../models/Qwen2.5-1.5B-AddTokens"
-    wiki_zh_path = '../mock/datasets/wiki_zh_2'
+    args = parse_args()
+    device = _resolve_device(args.device)
+    token_sequences = collect_token_sequences(args)
 
-    # wiki_en = load_dataset(wiki_path, "featured_en", split='train')
-    # wiki_de = load_dataset(wiki_path, "exzellent_de", split='train')
-    # wiki_zh = load_dataset(wiki_zh_path, split='train')
-    img_data = load_dataset("../new_data/ugen-pro/pretrain/converted_data/shijuezhongguo_gaozhiliang", split='train', streaming=True)
+    rows = []
+    for n in args.n_values:
+        if args.method == "chunked":
+            if not args.concatenate_sequences:
+                raise ValueError(
+                    "--method chunked requires --concatenate-sequences because it operates on one token stream."
+                )
+            entropy = calculate_ngram_conditional_entropy_chunked(
+                token_sequences,
+                n=n,
+                num_workers=args.num_workers,
+            )
+        else:
+            entropy = calculate_ngram_conditional_entropy(
+                token_sequences,
+                n=n,
+                device=device,
+                concatenate_sequences=args.concatenate_sequences,
+            )
 
-    # tkn = AutoTokenizer.from_pretrained(model_path)
+        print(f"{args.source_name}, n={n} entropy = {entropy:.4f} bits")
+        rows.append(
+            {
+                "source": args.source_name,
+                "n": n,
+                "entropy": round(entropy, 6),
+                "mode": args.mode,
+                "method": args.method,
+                "concatenate_sequences": args.concatenate_sequences,
+            }
+        )
 
-    # 下面 en, de 已经计算完毕
-    # en_token_list = get_tensor_list(wiki_en, tkn)
-    # for n in trange(1, 10, desc="English Entropy"):
-    #     entropy = calculate_ngram_conditional_entropy(en_token_list, n)
-    #     print(f"English Wikipedia, n={n} entropy = {entropy:.4f} bits")
-    #
-    # de_token_list = get_tensor_list(wiki_de, tkn)
-    # for n in trange(1, 10, desc="German Entropy"):
-    #     entropy = calculate_ngram_conditional_entropy(de_token_list, n)
-    #     print(f"German Wikipedia, n={n} entropy = {entropy:.4f} bits")
-    #
-    # de_token_list = get_tensor_list(wiki_zh, tkn)
-    # for n in trange(1, 10, desc="Chinese Entropy"):
-    #     entropy = calculate_ngram_conditional_entropy(de_token_list, n)
-    #     print(f"Chinese Wikipedia, n={n} entropy = {entropy:.4f} bits")
-
-    max_limit = 10_000_000
-    lst = []
-    for sample in tqdm(img_data, desc='collect img vqcode'):
-        if sample['vqcode_512'] is None:
-            continue
-
-        vqcode = json.loads(sample['vqcode_512'])
-        tensor = torch.tensor(vqcode)
-        assert tensor.dim() == 1
-        lst.append(tensor)
-        if len(lst) >= max_limit:
-            break
-
-    for n in range(3, 5):
-        entropy = calculate_ngram_conditional_entropy_optimized(lst, n)
-        print(f"Image, n={n} entropy = {entropy:.4f} bits")
+    if args.output_csv:
+        write_results_csv(Path(args.output_csv), rows, append=args.append)
 
 
 if __name__ == "__main__":

@@ -252,8 +252,46 @@ The project includes several useful tools for analysis:
 
   * `tools/analyze_model_grad.py`: Calculates and visualizes the cosine similarity of gradients between different modalities (text-only vs. multi-modal) during training to analyze the **gradient conflict** problem.
   * `draw_pics/grad_conflict.py`: Plots the results from the gradient analysis script.
-  * `tools/cal_entropy.py`: Computes the N-gram conditional entropy for different data sources (e.g., English Wikipedia, Chinese Wikipedia, image tokens) to measure data complexity and predictability.
+  * `tools/cal_entropy.py`: Computes N-gram conditional entropy from raw text or pre-tokenized sequences and can export the results as CSV.
+  * `draw_pics/conditional_entropy.py`: Plots the conditional-entropy curve used in Figure 2 from either a CSV file or raw entropy logs.
   * `tools/data_translator.py`: A utility to batch-translate datasets using an API.
+
+The released Figure 2 values are stored in `draw_pics/analysis_data/conditional_entropy.csv`. You can redraw the paper figure directly with:
+
+```bash
+python draw_pics/conditional_entropy.py
+```
+
+To recompute the table from your own data, first export entropy values with `tools/cal_entropy.py`, then point the plotting script at the generated CSV. Example commands:
+
+```bash
+python tools/cal_entropy.py \
+  --source-name English \
+  --input-format jsonl \
+  --input-jsonl /path/to/english.jsonl \
+  --mode text \
+  --text-key text \
+  --tokenizer /path/to/tokenizer \
+  --n-values 1 2 3 4 \
+  --output-csv draw_pics/analysis_data/custom_conditional_entropy.csv
+
+python tools/cal_entropy.py \
+  --source-name Image \
+  --input-format jsonl \
+  --input-jsonl /path/to/image_tokens.jsonl \
+  --mode tokens \
+  --token-key vqcode_512 \
+  --n-values 1 2 3 4 \
+  --concatenate-sequences \
+  --output-csv draw_pics/analysis_data/custom_conditional_entropy.csv \
+  --append
+
+python draw_pics/conditional_entropy.py \
+  --input draw_pics/analysis_data/custom_conditional_entropy.csv \
+  --output draw_pics/pics/custom_conditional_entropy.pdf
+```
+
+For large token streams, `--concatenate-sequences` matches the original high-throughput code path used in the paper, and `--method chunked` provides a CPU fallback when exact computation does not fit on a single device.
 
 ## 📄 License
 

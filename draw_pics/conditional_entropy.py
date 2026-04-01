@@ -1,101 +1,101 @@
-import os
+import argparse
+import re
+from pathlib import Path
 
 import pandas as pd
 import seaborn as sns
-import matplotlib.pyplot as plt
-import io
-import re
+from matplotlib import pyplot as plt
 
-data = '''
-English, n=1 entropy = 10.8332 bits
-English, n=2 entropy = 6.9576 bits
-English, n=3 entropy = 4.1062 bits
-English, n=4 entropy = 1.8410 bits
-English, n=5 entropy = 0.7664 bits
-English, n=6 entropy = 0.3536 bits
-English, n=7 entropy = 0.1824 bits
-English, n=8 entropy = 0.0923 bits
-English, n=9 entropy = 0.0444 bits
-German, n=1 entropy = 10.6777 bits
-German, n=2 entropy = 6.3728 bits
-German, n=3 entropy = 3.9527 bits
-German, n=4 entropy = 2.1524 bits
-German, n=5 entropy = 1.0638 bits
-German, n=6 entropy = 0.5098 bits
-German, n=7 entropy = 0.2360 bits
-German, n=8 entropy = 0.1117 bits
-German, n=9 entropy = 0.0600 bits
-Chinese, n=1 entropy = 11.4892 bits
-Chinese, n=2 entropy = 7.9386 bits
-Chinese, n=3 entropy = 3.9195 bits
-Chinese, n=4 entropy = 1.3671 bits
-Chinese, n=5 entropy = 0.5106 bits
-Chinese, n=6 entropy = 0.2215 bits
-Chinese, n=7 entropy = 0.1112 bits
-Chinese, n=8 entropy = 0.0651 bits
-Chinese, n=9 entropy = 0.0428 bits
-Image, n=1 entropy = 11.0564 bits
-Image, n=2 entropy = 10.2860 bits
-Image, n=3 entropy = 7.3884 bits
 
-'''
-
-'''backup
-Image, n=1 entropy = 11.0564 bits
-Image, n=2 entropy = 10.2860 bits
-Image, n=3 entropy = 3.4166 bits
-Image(num_img=1e6), n=3 entropy = 7.3884 bits
-Image, n=4 entropy = 0.2780 bits
-Image, n=5 entropy = 0.1498 bits
-Image, n=6 entropy = 0.0942 bits
-Image, n=7 entropy = 0.0618 bits
-Image, n=8 entropy = 0.0427 bits
-Image, n=9 entropy = 0.0312 bits
-'''
-
-# 使用正则表达式解析数据，更健壮
-pattern = re.compile(r'(.+), n=(\d+) entropy = ([\d.]+) bits')
-parsed_data = []
-for line in data.strip().split('\n'):
-    match = pattern.match(line)
-    if match:
-        source, n, entropy = match.groups()
-        if int(n) > 5: continue
-        parsed_data.append({
-            'source': source.strip(),
-            'n': int(n),
-            'entropy': float(entropy)
-        })
-
-# 创建DataFrame
-df = pd.DataFrame(parsed_data)
-
-# 设置绘图风格
-sns.set_style("whitegrid")
-
-# 定义调色板以区分不同数据源
-palette = {
-    'English': 'cornflowerblue',
-    'German': 'royalblue',
-    'Chinese': 'skyblue',
-    'Image': 'crimson'
+ROOT = Path(__file__).resolve().parent
+DEFAULT_INPUT = ROOT / "analysis_data" / "conditional_entropy.csv"
+DEFAULT_OUTPUT = ROOT / "pics" / "conditional_entropy.pdf"
+LOG_PATTERN = re.compile(r"(.+), n=(\d+) entropy = ([\d.]+) bits")
+SOURCE_ORDER = ["English", "German", "Chinese", "Image"]
+PALETTE = {
+    "English": "cornflowerblue",
+    "German": "royalblue",
+    "Chinese": "skyblue",
+    "Image": "crimson",
 }
 
-# 创建图表，设置大小
-plt.figure(figsize=(3, 4))
 
-# 绘制线图，按 source 对数据进行分组
-sns.lineplot(data=df, x='n', y='entropy', hue='source', marker='o', palette=palette)
+def load_entropy_table(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path)
+    else:
+        rows = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            match = LOG_PATTERN.match(line.strip())
+            if not match:
+                continue
+            source, n, entropy = match.groups()
+            rows.append(
+                {
+                    "source": source.strip(),
+                    "n": int(n),
+                    "entropy": float(entropy),
+                }
+            )
+        df = pd.DataFrame(rows)
 
-# 添加标题和标签
-# plt.title('Conditional Entropy vs. N-gram Size')
-plt.xlabel('N-gram (n)')
-plt.ylabel('Conditional Entropy (bits)')
-plt.legend(title='Data Source')
-# plt.yscale('log')
+    required_columns = {"source", "n", "entropy"}
+    missing_columns = required_columns - set(df.columns)
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {sorted(missing_columns)}")
+    return df
 
-os.makedirs('draw_pics/pics/', exist_ok=True)
-plt.savefig('draw_pics/pics/conditional_entropy.pdf', bbox_inches='tight')
 
-# 显示图形
-plt.show()
+def plot_conditional_entropy(df: pd.DataFrame, output_path: Path, max_n: int) -> None:
+    df = df[["source", "n", "entropy"]].copy()
+    df = df[df["n"] <= max_n].sort_values(["source", "n"])
+    if df.empty:
+        raise ValueError(f"No rows remain after filtering with --max-n {max_n}.")
+
+    sns.set_style("whitegrid")
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.serif": ["Times New Roman", "DejaVu Serif"],
+        }
+    )
+
+    plt.figure(figsize=(4, 3))
+    hue_order = [source for source in SOURCE_ORDER if source in set(df["source"])]
+    sns.lineplot(
+        data=df,
+        x="n",
+        y="entropy",
+        hue="source",
+        hue_order=hue_order,
+        marker="o",
+        palette=PALETTE,
+    )
+
+    plt.xlabel("N-gram (n)")
+    plt.ylabel("Conditional Entropy (bits)")
+    plt.legend(title=None)
+    plt.tight_layout()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, bbox_inches="tight")
+    plt.close()
+    print(f"Saved plot to {output_path}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Plot the conditional-entropy curve used in Figure 2.")
+    parser.add_argument("--input", default=str(DEFAULT_INPUT), help="CSV file or raw log file containing entropy results.")
+    parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="Output figure path.")
+    parser.add_argument("--max-n", type=int, default=4, help="Maximum n value to include in the plot.")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    df = load_entropy_table(Path(args.input))
+    plot_conditional_entropy(df, Path(args.output), max_n=args.max_n)
+
+
+if __name__ == "__main__":
+    main()
